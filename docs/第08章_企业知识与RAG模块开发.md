@@ -2,6 +2,235 @@
 
 [文档导航](README.md) · [上一章：报告](第07章_生产运行日报与事件复盘模块开发.md) · [下一章：会议录音知识化](第09章_会议录音转写与知识发布.md)
 
+## 8.0 RAG、Elasticsearch与Neo4j的基本概念
+
+阅读顺序与第5章一致：先理解概念，再看项目如何使用，最后看代码、接口和验收。下面的示意资料仅用于讲解，不是实际规程或生产结论。通用技术能力与当前实现分别说明，不能把面试中的优化思路当成已上线功能。
+
+### 8.0.1 RAG：先找证据，再组织回答
+
+RAG是Retrieval-Augmented Generation，即检索增强生成。假设用户问“某型号阀门出现压力波动，应查哪些处置要求”，模型仅靠训练知识无法知道企业当前有效的规程。RAG先从允许访问的资料中找证据，把问题和证据一起交给模型，再检查回答能否回到原文。
+
+```text
+入库：原文件 → 结构解析 → 分块与关系抽取 → 全文/向量/关系索引 → 审核发布
+问答：问题 → 当前权限与版本范围 → 召回 → 融合 → 重排
+     → 证据上下文 → 生成结论 → 引用与支持性校验 → 回答或拒答
+```
+
+RAG不改变模型权重；微调通过训练调整模型行为或能力；长上下文直接容纳更多输入，但仍受长度、成本和信息筛选影响。三者可以组合。资料频繁更新且要求可追溯时，检索适合提供外部证据，但不能保证模型一定正确使用证据。
+
+本项目使用固定RAG流水线，主要入口为`retrieval.py`与`answers.py`。它没有让模型自主循环选择任意工具；与第5章的事件调查Agent应分开理解。
+
+### 8.0.2 文档、块、证据与上下文不是同一个对象
+
+| 概念 | 含义 | 项目对应 |
+|---|---|---|
+| Document | 稳定的资料身份 | `KnowledgeDocument`，例如同一份设备手册 |
+| Version | 一次确定的资料版本 | `KnowledgeVersion`，带生效时间、审核和发布状态 |
+| Chunk | 用于召回的片段 | `KnowledgeChunk`，保留正文和定位信息 |
+| Evidence | 本次回答实际使用的证据 | 片段ID、原文、版本、标题与定位等 |
+| Context | 本次交给模型的信息 | 问题、筛选后的证据及必要历史信息 |
+
+块太小可能丢失前提、表头和否定条件；块太大可能混合主题、稀释相关性并占满预算。overlap表示相邻块重叠，能保留部分边界信息，也会产生重复。本项目优先使用结构和意图分段，并保留父级文本，不能描述为统一固定窗口加重叠。
+
+父子检索的思路是用较小片段找到位置，再带回较大的父上下文。项目在父文本不超过8000字符时使用父文本，否则退回片段；即使命中，预算不足也可能不进入最终上下文。Chunk、中文字符和模型Token不是同一计量单位。
+
+### 8.0.3 稀疏召回、稠密向量与Embedding
+
+词法检索关注查询词与资料词项的匹配，适合术语和编号；稠密检索把文本映射成固定维度向量，利用距离或相似度寻找语义接近的片段，适合不同措辞表达相近意思。语义相近不表示型号、日期、否定条件相同，因此两路需要互补。
+
+Embedding是生成向量的模型或过程，不负责直接生成回答。相同维度并不意味着两个模型的向量可比较：模型权重版本、文本处理方式和距离度量也影响向量空间。本项目按模型快照与代次隔离，查询与入库模型必须兼容；Qdrant使用Cosine距离配置，ES不承担本项目的向量存储。
+
+精确近邻逐项比较；ANN（近似最近邻）用索引减少搜索开销，通常以一定召回损失换取速度。HNSW通过多层邻接图缩小候选范围，是常见ANN算法；它的内部索引图不是Neo4j里的业务知识图谱。当前代码没有实现自行训练向量模型或自动调优HNSW参数。
+
+### 8.0.4 召回、RRF融合和Rerank重排
+
+召回先尽可能找到相关候选，重排再对候选做更细的排序。重排无法找回从未进入候选池的证据。常见重排模型联合处理“问题—片段”，比离线编码后直接比较向量更适合细粒度匹配，但在线计算成本更高。
+
+不同通道原始分数的尺度不同，不能把BM25分数与向量相似度直接当成同一单位相加。RRF（Reciprocal Rank Fusion）只用排名：
+
+```text
+RRF(d) = 对所有命中列表求和 1 / (k + rank(d))
+本项目 k = 60；rank从1开始；代码的零起始rank写成60 + rank + 1。
+```
+
+例如某证据分别排第1和第3，贡献为`1/61 + 1/63`。这是融合优先级，不是答案正确概率。本项目每个查询的全文/向量通道各取40条，融合后最多60个候选，再调用重排；图结果也按返回顺序贡献排名分，图通道当前按事实ID排序，并非语义相关度排序。global另走范围汇集路径，不能套用普通Top-K解释。
+
+### 8.0.5 Elasticsearch：索引、文档、字段与分片
+
+Elasticsearch（ES）是基于Lucene的搜索引擎。Index是存放一类搜索文档的逻辑集合；Document是一个JSON记录；Field是其中的字段；Shard是索引的分片，主分片承接数据，副本分片提供冗余与读取能力。分片内由Lucene维护可搜索的数据结构。
+
+ES文档不一定对应一份上传文件。本项目一条ES文档对应一个证据片段，`_id`使用证据UUID，同一资料版本会有多条片段。索引名称由前缀与generation构成，实际名称通过`generation_name()`生成。原件在对象存储，发布与权限事实在PostgreSQL。
+
+副本不能与其主分片放在同一节点来提供节点级容错。仓库Compose为`single-node`，不能宣称已部署多节点高可用；主副分片数也没有在当前适配器中显式设置。green表示主副分片均已分配，yellow表示主分片可用但存在未分配副本，red表示有主分片未分配。健康状态不能代替业务权限和召回验收。
+
+### 8.0.6 倒排索引：为什么能从词找到资料
+
+通常说的“反向索引”在全文检索中更常称为**倒排索引**。正向查看是“片段 → 内容或词项”；倒排查看是“词项 → 包含它的片段列表”，列表还可以保存词频、位置等信息。
+
+以下使用人为划分的词项说明结构，不代表当前`cjk`的真实分词输出：
+
+```text
+片段A：阀门 / 压力 / 波动
+片段B：阀门 / 检查
+
+阀门 → A、B
+压力 → A
+波动 → A
+检查 → B
+```
+
+搜索“压力”时从词项入口找到A，无须逐段扫描全部原文。词项位置还能支持短语匹配。倒排索引解决“哪些片段包含这些词”；BM25等相关性算法解决“候选如何排序”；向量检索解决另一类语义相似性问题。
+
+`_source`用于返回JSON原文，倒排结构用于词项查找，doc values是常用于排序和聚合的列式结构。它们目的不同，不能认为拿到了`_source`就表示所有字段都可搜索。
+
+### 8.0.7 Mapping：字段应该怎样被理解和索引
+
+Mapping规定字段类型、分析器及是否参与索引等规则，类似搜索文档的结构契约。动态映射可以根据新字段推断类型；显式映射把规则写清楚；`dynamic: strict`拒绝未声明字段，避免拼写错误或任意字段膨胀。本项目使用以下显式映射，来源为[ES适配器](../app/infrastructure/knowledge/http.py)：
+
+```json
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "id": {"type": "keyword"},
+      "version_id": {"type": "keyword"},
+      "title": {
+        "type": "text", "analyzer": "cjk",
+        "fields": {"exact": {"type": "keyword"}}
+      },
+      "text": {"type": "text", "analyzer": "cjk"},
+      "locator": {"type": "object", "enabled": false}
+    }
+  }
+}
+```
+
+| 配置 | 为什么这样设计 | 当前使用边界 |
+|---|---|---|
+| `id`、`version_id: keyword` | 整体词项适合ID精确筛选 | `version_id`承接数据库给出的可见版本列表 |
+| `title`、`text: text` | 分析后支持全文检索 | 两者都使用`cjk` |
+| `title.exact: keyword` | 同一标题的多字段表示，支持整体值操作 | 当前查询不使用它，不等于已实现精确标题查询接口 |
+| `locator.enabled: false` | 原样保留定位对象，不解析其内部索引字段 | 可从`_source`返回，不能按内部页码字段直接检索 |
+
+`text`适合分析后的正文，`keyword`适合ID、枚举和整体值。排序、分组聚合通常选keyword字段；不能为了对正文聚合就随意开启占用堆内存的fielddata。类型说明见[Elastic text文档](https://www.elastic.co/guide/en/elasticsearch/reference/current/text.html)与[keyword文档](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/keyword)。
+
+已索引字段通常不能原地改成另一种类型，改变分析规则也不会自动重写旧词项。一般需要建立新索引并重新索引后切换读取。项目按generation隔离索引，但`initialize()`遇到已存在索引就返回，**不会验证或修复旧mapping，也没有自动别名切换流程**；更新分析器时必须安排重建和验证。
+
+### 8.0.8 分词与Analyzer：写入和查询都要看
+
+Analyzer（分析器）由字符过滤器、一个Tokenizer和若干Token Filter组成：字符过滤器先处理原字符，Tokenizer切出词项，Token Filter再做大小写转换、停用词或词项组合等处理。Tokenizer只是分析器的一部分。
+
+索引时分析决定倒排索引写入哪些词项；查询时分析决定搜索哪些词项。两侧规则不协调会导致漏召回。ES允许独立设置`search_analyzer`；本项目没有单独设置，使用字段配置的`cjk`。见[分析器选择规则](https://www.elastic.co/docs/manage-data/data-store/text-analysis/specify-an-analyzer)。
+
+`cjk`使用standard tokenizer，并结合宽度归一化、lowercase、CJK bigram及停用词处理。bigram对相邻CJK字符组词，不是按管道专业词典识别完整词语。比如连续汉字的词项可能跨越人理解的词语边界；必须检查实际输出，不能把中文词语直觉当成分词结果。见[Elastic语言分析器源码文档](https://github.com/elastic/elasticsearch/blob/main/docs/reference/text-analysis/analysis-lang-analyzer.md)。
+
+下面是在ES Dev Tools中检查分词的只读请求；它不经过本项目业务API，需使用具备ES访问权限的环境：
+
+```http
+POST /_analyze
+{
+  "analyzer": "cjk",
+  "text": "阀门压力波动 XJ-100"
+}
+```
+
+观察token和position，尤其检查中文术语、型号连字符、大小写及编号是否被拆开。项目没有安装IK、维护行业自定义词典或配置同义词；这些是可评测的后续方案，不能写成已有实现。增加同义词也可能混淆型号或上下位概念，需要检查误召回。
+
+### 8.0.9 Query DSL：match、term、bool与BM25
+
+`match`对查询文字分析后匹配；`multi_match`扩展到多个字段。`term/terms`匹配索引中的精确词项，不执行与全文查询相同的分析过程，因此常用于keyword字段，不能把整句直接交给text字段的term查询并期待自动分词。
+
+`bool.must`要求匹配并参与评分，`filter`只限定范围不贡献相关度，`must_not`排除，`should`表达可选或按`minimum_should_match`约束的条件。本项目查询体的核心结构如下，UUID需换成服务端实际授权的版本ID：
+
+```json
+{
+  "size": 40,
+  "query": {
+    "bool": {
+      "filter": [{"terms": {"version_id": ["已授权的版本UUID"]}}],
+      "must": [{"multi_match": {
+        "query": "阀门压力波动", "fields": ["title^3", "text"]
+      }}]
+    }
+  }
+}
+```
+
+`title^3`提高标题字段匹配的权重，不保证标题命中永远排第一。ES默认BM25综合词频、逆文档频率和长度归一化：词频贡献会趋于饱和，少见词更有区分力，长文本不会仅靠堆词数占优势。分数不是概率，不能跨问题直接解释成准确率。项目没有自定义similarity或调优BM25参数。见[BM25设置](https://www.elastic.co/docs/reference/elasticsearch/index-settings/similarity)。
+
+组织、ACL、发布状态、生效时间与设备型号先由PostgreSQL计算成版本白名单，再通过`terms(version_id)`传入ES；当前mapping没有这些独立权限字段。ES返回后仍回查数据库，客户端不能自行提交一个ES过滤器来获得授权。
+
+### 8.0.10 写入可见性：Bulk、refresh、flush与merge
+
+Bulk把多条写入组成批请求，减少往返；HTTP成功不代表所有条目成功。本项目使用NDJSON，逐片段固定`_id`写入，检查响应`errors`，局部失败抛出`INDEX_PARTIAL_FAILURE`，并非全批原子事务。
+
+refresh使新写入的内容对搜索可见，ES因此属于近实时搜索。项目Bulk使用`refresh=wait_for`等待刷新可见，而非每批强制刷新。flush涉及Lucene提交及translog代际管理，主要服务恢复与持久化；segment merge合并段、回收已删除文档占用的空间。三者不能互相替代，refresh也不等于业务版本已审核发布。见[refresh API](https://www.elastic.co/docs/api/doc/elasticsearch/v8/operation/operation-indices-refresh)。
+
+translog是为恢复记录写操作的日志；写入确认的持久性还受相关配置影响。不要把“搜索到了”推断成“四个数据库已在一个事务中提交”。撤回先由PostgreSQL切断业务可见性，即使ES删除失败，残留命中也不能继续进入答案。
+
+### 8.0.11 ES常见追问：分页、nested、重建与排障
+
+| 面试问题 | 概念与回答方向 | 本项目情况 |
+|---|---|---|
+| 深分页为什么贵？ | `from + size`增大时各分片需维护更多候选；深遍历常用稳定排序的`search_after`，结合PIT固定搜索视图 | 当前RAG只取Top-K，没有实现搜索结果深分页/PIT |
+| object与nested有什么区别？ | 对象数组扁平化可能丢失同一数组元素内字段配对；nested保留独立匹配边界，但增加成本 | `locator`是禁用索引的object，没有nested查询 |
+| 分片越多越好吗？ | 分片增加并行性，也增加协调、内存和小分片开销，应按数据量与负载验证 | 当前单节点配置不能作为容量结论 |
+| 重建如何保持可用？ | 新建索引、回填、校验、追平变更、切换读取；别名切换只是其中一环 | 已有代次隔离，没有完整在线迁移编排 |
+| 写入成功却搜不到？ | 依次检查索引名/代次、Bulk条目错误、refresh、授权版本、分词输出、查询字段 | 还需确认数据库版本已发布且在生效范围 |
+| 编号搜不准怎么办？ | 检查分析结果，必要时建独立keyword字段；词法匹配不天然等于编号精确匹配 | 当前没有独立文档编号字段的ES精确查询 |
+
+这些通用机制可继续查阅[Elastic分页](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results)、[nested类型](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/nested)与[translog说明](https://www.elastic.co/docs/reference/elasticsearch/index-settings/translog)。
+
+### 8.0.12 Neo4j：节点、关系、属性、标签与Cypher
+
+Neo4j采用属性图模型：节点表示对象，关系连接节点，节点与关系可以携带属性；Label为节点分类，关系类型描述连接类型，Path是节点和关系构成的路径。Cypher用图模式表达查询，`MATCH`查找、`WHERE`过滤、`RETURN`返回，`CREATE`创建，`MERGE`匹配或创建模式。见[Neo4j图概念](https://neo4j.com/docs/getting-started/appendix/graphdb-concepts/)。
+
+知识图谱是组织领域实体与关系的方法，图数据库是存储和查询手段，GraphRAG是利用图结构辅助检索与生成的一类方法。这三个概念不能画等号。关系型数据库同样能保存关系；图模型适合围绕连接展开的问题，并非所有查询都比SQL更快。
+
+例如“设备A—存在现象—压力波动”必须关联原文和版本。同名实体也不必然是同一个真实设备；当前用实体字符串作key，没有完整的实体消歧或企业主数据对齐。
+
+### 8.0.13 项目图模型：为什么把事实单独建成节点
+
+本项目不是为每一种业务关系动态创建一种边，而是将source、relation、target、evidence_id、version_id保存到`KnowledgeFact`节点，通过两类固定关系连接实体：
+
+```text
+(KnowledgeEntity {key: 设备A})
+             ↑ SUBJECT
+(KnowledgeFact {source: 设备A, relation: 存在现象,
+                target: 压力波动, evidence_id: …, version_id: …})
+             ↓ OBJECT
+(KnowledgeEntity {key: 压力波动})
+```
+
+两条箭头都从事实节点发出。业务关系名称是事实节点上的`relation`属性，不是`SUBJECT/OBJECT`边的类型。这样同一对实体的不同资料、不同版本和不同证据可以各自保留事实身份，查询后还能回到PostgreSQL核验。
+
+唯一约束分别是事实的`(namespace, generation, id)`和实体的`(namespace, generation, key)`。namespace来自索引前缀，generation隔离代次；它们不是用户权限校验的替代品。`MERGE`复用身份，`SET`更新属性，唯一约束约束重复节点；不要宣称单靠任意MERGE语句就能保证所有并发业务幂等。见[MERGE语义](https://neo4j.com/docs/cypher-manual/current/clauses/merge/)。
+
+### 8.0.14 邻接、多跳与图检索的边界
+
+邻接查询从一个实体找到相连事实；多跳把事实另一端的实体作为下一轮起点。项目每次`neighbors()`查一轮，应用层最多扩展两轮，每轮前沿最多5个实体，每个实体最多取20个事实；`seen`避免重复扩展。这里“一跳”按业务实体扩展理解，物理图中实体到实体经过事实节点和两条边。
+
+Cypher通过参数传递实体名和版本列表，使用固定查询；没有模型生成并执行任意Cypher的能力。每轮还回查PostgreSQL中的事实ID、source/relation/target与evidence_id，防止把外部图返回值直接当作可信证据。
+
+图查询常见风险是起点扫描、超级节点与路径爆炸。索引/约束帮助定位起点，限制方向、关系类型、跳数和结果范围控制扩展；`EXPLAIN`查看计划，`PROFILE`实际执行并报告统计，二者不能混淆。项目已有有限邻接扩展，但没有社区发现、社区摘要或完整全局图推理。
+
+### 8.0.15 RAG面试常问：效果、幻觉与评测指标
+
+| 概念或问题 | 怎样解释 | 当前实现边界 |
+|---|---|---|
+| Recall@K | 前K条找回了多少已标注相关证据，占全部相关证据的比例 | 已计算recall，标注依赖片段ID |
+| MRR | 首条相关结果排名倒数的平均值，关心“多快看到第一条正确证据” | 已计算mrr |
+| nDCG | 对靠前的相关结果给予更大权重，再除以理想排序得分 | 当前使用二元相关标签，不是专家多级相关度 |
+| Precision@K | 前K条中相关证据的比例，衡量噪声 | 当前评测结果未输出此指标 |
+| 忠实性与正确性 | 忠实性看结论是否由上下文支持；正确性还需可信标准答案 | 引句匹配和模型复核不能替代领域正确性评审 |
+| 检索失败与生成失败 | 先看证据是否召回、是否被重排或预算丢弃，再看模型是否误读 | 结合trace的routes、rerank、selected_ids定位 |
+| 提示注入 | 资料中的指令可能诱导模型偏离用户任务 | 资料只作证据，权限靠服务端校验；不能只依靠提示词 |
+| 拒答率越高越安全吗？ | 既要看无证据时拒答，也要看有证据时是否错误拒答 | should_refuse匹配只是一个指标，不等于答案准确率 |
+
+Recall示例：标注相关证据为A、B、C，返回B、X、A，则Recall为2/3，首条即相关所以该样本倒数排名为1。代码对“标注为空”的情况另有约定，详见[evaluation.py](../app/modules/knowledge/application/evaluation.py)；比较不同实验必须保持数据集和口径一致。
+
+常见优化应按失败阶段进行：先检查解析与分块，再检查版本范围、分析器与召回，再检查重排、上下文和生成。增大Top-K可能带来噪声和延迟，不保证改善答案；更换Embedding后必须处理已有向量兼容性。第8.13节给出项目实际评测边界，[项目面试题](项目面试题.md)提供可口述的问答。
+
 ## 8.1 业务定位
 
 知识模块面向规程、标准、设备手册、案例、交接班材料和通知等复杂资料，提供可审核、可追溯、可撤回的知识检索与问答。复杂性来自资料结构、权限、版本、生效时间和引用可信度，不来自堆叠Agent。
