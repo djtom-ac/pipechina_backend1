@@ -225,3 +225,4 @@ async def bump_authz_version(session: AsyncSession, user_id: UUID) -> None:
     user = await session.get(UserAccount, user_id)  # 锁定待更新账号
     if user is not None:
         user.authz_version += 1
+
